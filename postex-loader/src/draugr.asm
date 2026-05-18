@@ -110,20 +110,72 @@
         ; Adjusting the param struct for the fixup
         ; ----------------------------------------------------------------------
 
-        mov r11, rsi              ; Copying function to call into r11
+        mov r11, rsi              ; r11 = function to call (rsi still holds it from top)
 
-        mov [ rdi + 8 ], r12      ; Real return address is now moved into the "OG_retaddr" member
-        mov [ rdi + 16 ], rbx     ; original rbx is stored into "rbx" member
-        lea rbx, [ rel fixup ]    ; Fixup address is moved into rbx
-        mov [ rdi ], rbx          ; Fixup member now holds the address of Fixup
-        mov rbx, rdi              ; Address of param struct (Fixup) is moved into rbx
+        mov [ rdi + 8 ], r12      ; struct.OriginalReturnAddress = real return address
+        mov [ rdi + 16 ], rbx     ; struct.Rbx = original rbx (will be overwritten below)
+
+        lea rax, [ rel fixup ]
+        mov [ rdi ], rax          ; struct.Fixup = address of fixup label
+
+        ; RBX always points to the struct so fixup can recover it regardless of which
+        ; register the gadget uses.  gadget_reg = struct_ptr - GadgetOffset so that
+        ; [gadget_reg + GadgetOffset] = [struct_ptr + 0] = struct.Fixup.
+        mov rbx, rdi
+
+        movsxd r13, DWORD [ rdi + 132 ]   ; r13 = GadgetOffset (signed 32->64)
+        mov r14, rdi
+        sub r14, r13                        ; r14 = struct_ptr - GadgetOffset
 
         ; ----------------------------------------------------------------------
         ; Syscall stuff. Shouldn't affect performance even if a syscall isnt made
         ; ----------------------------------------------------------------------
         mov r10, rcx
         mov rax, [ rdi + 72 ]
-        
+
+        ; ----------------------------------------------------------------------
+        ; Set the gadget register.  RBX (enum 0) is already struct_ptr (offset
+        ; must be 0 for RBX gadgets, enforced by find_gadget_info).  All other
+        ; callee-saved registers are set to struct_ptr - GadgetOffset.
+        ; After this block rdi may be clobbered, so all struct reads are done.
+        ; ----------------------------------------------------------------------
+        mov r15d, DWORD [ rdi + 128 ]      ; GadgetReg enum value
+
+        cmp r15d, 0                          ; GADGET_REG_RBX – already done
+        je gr_done
+
+        cmp r15d, 1                          ; GADGET_REG_RDI
+        jne gr_not_rdi
+        mov rdi, r14
+        jmp gr_done
+        gr_not_rdi:
+
+        cmp r15d, 2                          ; GADGET_REG_RSI
+        jne gr_not_rsi
+        mov rsi, r14
+        jmp gr_done
+        gr_not_rsi:
+
+        cmp r15d, 3                          ; GADGET_REG_R12
+        jne gr_not_r12
+        mov r12, r14
+        jmp gr_done
+        gr_not_r12:
+
+        cmp r15d, 4                          ; GADGET_REG_R13
+        jne gr_not_r13
+        mov r13, r14
+        jmp gr_done
+        gr_not_r13:
+
+        cmp r15d, 5                          ; GADGET_REG_R14 (r14 already = value)
+        jne gr_not_r14
+        jmp gr_done
+        gr_not_r14:
+
+        mov r15, r14                         ; GADGET_REG_R15
+
+        gr_done:
         jmp r11
 
         fixup:

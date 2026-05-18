@@ -72,6 +72,22 @@ typedef struct {
     PVOID           SpoofCall;
 } DRAUGR_FUNCTION_CALL;
 
+typedef enum {
+    GADGET_REG_RBX = 0,
+    GADGET_REG_RDI,
+    GADGET_REG_RSI,
+    GADGET_REG_R12,
+    GADGET_REG_R13,
+    GADGET_REG_R14,
+    GADGET_REG_R15,
+} GADGET_REGISTER;
+
+typedef struct {
+    PVOID           Address;
+    GADGET_REGISTER Register;
+    INT32           Offset;
+} GADGET_INFO;
+
 typedef struct {
     PVOID Fixup;
     PVOID OriginalReturnAddress;
@@ -89,6 +105,8 @@ typedef struct {
     PVOID R13;
     PVOID R14;
     PVOID R15;
+    DWORD GadgetReg;
+    INT32 GadgetOffset;
 } DRAUGR_PARAMETERS;
 
 extern PVOID draugr_stub ( PVOID, PVOID, PVOID, PVOID, DRAUGR_PARAMETERS *, PVOID, SIZE_T, PVOID, PVOID, PVOID, PVOID, PVOID, PVOID, PVOID, PVOID );
@@ -108,7 +126,12 @@ void init_frame_info ( SYNTHETIC_STACK_FRAME * frame )
     frame->Frame2.FunctionAddress = ( PVOID ) GetProcAddress ( ( HMODULE ) frame2_module, "RtlUserThreadStart" );
     frame->Frame2.Offset          = 0x2c;
 
-    frame->Gadget                 = KERNEL32$GetModuleHandleA ( "KernelBase.dll" );
+    PVOID lib = KERNEL32$GetModuleHandleA ( "combase.dll" );
+    if ( lib != NULL ) {
+        frame->Gadget = lib;
+    } else {
+        frame->Gadget = LoadLibraryA ( "combase.dll" );
+    }
 }
 
 BOOL get_text_section_size ( PVOID module, PDWORD virtual_address, PDWORD size )
@@ -249,48 +272,185 @@ PVOID calculate_function_stack_size_wrapper ( PVOID return_address )
     return calculate_function_stack_size ( runtime_function, image_base );
 }
 
-PVOID find_gadget( PVOID module )
+/*
+ * Returns TRUE if the byte sequence immediately before (section_start + offset)
+ * forms a valid CALL instruction, meaning the gadget address is a legitimate
+ * return site. Checks the most common x64 CALL encodings:
+ *   E8 rel32               (5 bytes, direct near call)
+ *   FF /2  mod=11          (2 bytes, CALL reg)
+ *   41 FF /2  mod=11       (3 bytes, CALL R8-R15)
+ *   FF 15 disp32           (6 bytes, RIP-relative indirect call)
+ *   FF /2  mod=00 rm≠4,5   (2 bytes, CALL [reg])
+ *   FF /2  mod=01 rm≠4     (3 bytes, CALL [reg+d8])
+ *   FF /2  mod=10 rm≠4     (6 bytes, CALL [reg+d32])
+ */
+static BOOL is_preceded_by_call ( PBYTE section_start, DWORD offset )
 {
-    BOOL  found_gadgets       = FALSE;
-    DWORD text_section_size   = 0;
-    DWORD text_section_va     = 0;
-    DWORD counter             = 0;
-    ULONG seed                = 0;
-    ULONG random              = 0;
-    PVOID module_text_section = NULL;
+    PBYTE g = section_start + offset;
 
-    PVOID gadget_list [ 15 ] = { 0 };
+    /* E8 rel32 - direct near call (5 bytes) */
+    if ( offset >= 5 && g[-5] == 0xE8 ) {
+        return TRUE;
+    }
 
-    if ( ! found_gadgets )
-    {
-        if ( ! get_text_section_size ( module, &text_section_va, &text_section_size ) ) {
-            return NULL;
+    /* FF /2 variants - opcode extension 2: bits [5:3] of ModRM == 010 */
+    if ( offset >= 2 && g[-2] == 0xFF && ( g[-1] & 0x38 ) == 0x10 ) {
+        BYTE mod = g[-1] >> 6;
+        BYTE rm  = g[-1] & 0x07;
+        /* mod=11: CALL reg (2 bytes) */
+        if ( mod == 3 ) { return TRUE; }
+        /* mod=00: CALL [reg], rm not 4 (SIB) or 5 (disp32-only / RIP) */
+        if ( mod == 0 && rm != 4 && rm != 5 ) { return TRUE; }
+    }
+
+    /* 41 FF /2 mod=11 - CALL R8..R15 (3 bytes) */
+    if ( offset >= 3 && g[-3] == 0x41 && g[-2] == 0xFF &&
+         ( g[-1] & 0x38 ) == 0x10 && ( g[-1] >> 6 ) == 3 ) {
+        return TRUE;
+    }
+
+    /* FF /2 mod=01 rm≠4 - CALL [reg+d8] (3 bytes) */
+    if ( offset >= 3 && g[-3] == 0xFF &&
+         ( g[-2] & 0x38 ) == 0x10 && ( g[-2] >> 6 ) == 1 && ( g[-2] & 0x07 ) != 4 ) {
+        return TRUE;
+    }
+
+    /* FF 15 disp32 - RIP-relative indirect call (6 bytes) */
+    if ( offset >= 6 && g[-6] == 0xFF && g[-5] == 0x15 ) {
+        return TRUE;
+    }
+
+    /* FF /2 mod=10 rm≠4 - CALL [reg+d32] (6 bytes) */
+    if ( offset >= 6 && g[-6] == 0xFF &&
+         ( g[-5] & 0x38 ) == 0x10 && ( g[-5] >> 6 ) == 2 && ( g[-5] & 0x07 ) != 4 ) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/*
+ * Tries to match a JMP [REG+offset] gadget at position p (with `remaining'
+ * bytes available). Supported registers: RBX (offset=0 only), RSI, RDI,
+ * R12, R13, R14, R15. Returns TRUE and fills *info on success.
+ */
+static BOOL match_gadget_pattern ( PBYTE p, DWORD remaining, GADGET_INFO * info )
+{
+    if ( remaining < 2 ) return FALSE;
+
+    /* ---- Non-REX forms (RBX, RSI, RDI) ---- */
+    if ( p[0] == 0xFF ) {
+        BYTE modrm = p[1];
+
+        /* JMP [RBX]  FF 23  (offset=0 only – RBX is the fixup anchor) */
+        if ( modrm == 0x23 ) { info->Register = GADGET_REG_RBX; info->Offset = 0; return TRUE; }
+        /* JMP [RSI]  FF 26 */
+        if ( modrm == 0x26 ) { info->Register = GADGET_REG_RSI; info->Offset = 0; return TRUE; }
+        /* JMP [RDI]  FF 27 */
+        if ( modrm == 0x27 ) { info->Register = GADGET_REG_RDI; info->Offset = 0; return TRUE; }
+
+        if ( remaining >= 3 ) {
+            INT8 d8 = ( INT8 ) p[2];
+            /* JMP [RSI+d8]  FF 66 d8 */
+            if ( modrm == 0x66 ) { info->Register = GADGET_REG_RSI; info->Offset = d8; return TRUE; }
+            /* JMP [RDI+d8]  FF 67 d8 */
+            if ( modrm == 0x67 ) { info->Register = GADGET_REG_RDI; info->Offset = d8; return TRUE; }
         }
 
-        module_text_section = ( PBYTE ) ( ( UINT_PTR ) module + text_section_va );
+        if ( remaining >= 6 ) {
+            INT32 d32 = ( INT32 ) ( p[2] | ( ( DWORD ) p[3] << 8 ) | ( ( DWORD ) p[4] << 16 ) | ( ( DWORD ) p[5] << 24 ) );
+            /* JMP [RSI+d32]  FF A6 d32 */
+            if ( modrm == 0xA6 ) { info->Register = GADGET_REG_RSI; info->Offset = d32; return TRUE; }
+            /* JMP [RDI+d32]  FF A7 d32 */
+            if ( modrm == 0xA7 ) { info->Register = GADGET_REG_RDI; info->Offset = d32; return TRUE; }
+        }
+    }
 
-        for ( int i = 0; i < ( text_section_size - 2 ); i++ )
-        {
-            /* x64 opcodes are ff 23 */
-            if ( ( ( PBYTE ) module_text_section ) [ i ] == 0xFF && ( ( PBYTE ) module_text_section ) [ i + 1 ] == 0x23 )
-            {
-                gadget_list [ counter ] = ( PVOID ) ( ( UINT_PTR ) module_text_section + i );
-                counter++;
+    /* ---- REX.B (0x41) forms (R12, R13, R14, R15) ---- */
+    if ( remaining >= 3 && p[0] == 0x41 && p[1] == 0xFF ) {
+        BYTE modrm = p[2];
 
-                if ( counter == 15 ) {
-                    break;
-                }          
+        /* JMP [R12]   41 FF 24 24  (rm=4 needs SIB 0x24) */
+        if ( remaining >= 4 && modrm == 0x24 && p[3] == 0x24 ) {
+            info->Register = GADGET_REG_R12; info->Offset = 0; return TRUE;
+        }
+        /* JMP [R14]   41 FF 26 */
+        if ( modrm == 0x26 ) { info->Register = GADGET_REG_R14; info->Offset = 0; return TRUE; }
+        /* JMP [R15]   41 FF 27 */
+        if ( modrm == 0x27 ) { info->Register = GADGET_REG_R15; info->Offset = 0; return TRUE; }
+
+        if ( remaining >= 4 ) {
+            /* JMP [R12+d8]  41 FF 64 24 d8 */
+            if ( remaining >= 5 && modrm == 0x64 && p[3] == 0x24 ) {
+                info->Register = GADGET_REG_R12; info->Offset = ( INT8 ) p[4]; return TRUE;
             }
+            /* JMP [R13+d8]  41 FF 65 d8  (d8=0 encodes [R13] with no disp) */
+            if ( modrm == 0x65 ) { info->Register = GADGET_REG_R13; info->Offset = ( INT8 ) p[3]; return TRUE; }
+            /* JMP [R14+d8]  41 FF 66 d8 */
+            if ( modrm == 0x66 ) { info->Register = GADGET_REG_R14; info->Offset = ( INT8 ) p[3]; return TRUE; }
+            /* JMP [R15+d8]  41 FF 67 d8 */
+            if ( modrm == 0x67 ) { info->Register = GADGET_REG_R15; info->Offset = ( INT8 ) p[3]; return TRUE; }
         }
 
-        found_gadgets = TRUE;
+        if ( remaining >= 7 ) {
+            INT32 d32 = ( INT32 ) ( p[3] | ( ( DWORD ) p[4] << 8 ) | ( ( DWORD ) p[5] << 16 ) | ( ( DWORD ) p[6] << 24 ) );
+            /* JMP [R12+d32]  41 FF A4 24 d32  (SIB at p[3], d32 at p[4..7]) */
+            if ( remaining >= 8 && modrm == 0xA4 && p[3] == 0x24 ) {
+                INT32 dr12 = ( INT32 ) ( p[4] | ( ( DWORD ) p[5] << 8 ) | ( ( DWORD ) p[6] << 16 ) | ( ( DWORD ) p[7] << 24 ) );
+                info->Register = GADGET_REG_R12; info->Offset = dr12; return TRUE;
+            }
+            /* JMP [R13+d32]  41 FF A5 d32 */
+            if ( modrm == 0xA5 ) { info->Register = GADGET_REG_R13; info->Offset = d32; return TRUE; }
+            /* JMP [R14+d32]  41 FF A6 d32 */
+            if ( modrm == 0xA6 ) { info->Register = GADGET_REG_R14; info->Offset = d32; return TRUE; }
+            /* JMP [R15+d32]  41 FF A7 d32 */
+            if ( modrm == 0xA7 ) { info->Register = GADGET_REG_R15; info->Offset = d32; return TRUE; }
+        }
+    }
+
+    return FALSE;
+}
+
+BOOL find_gadget_info ( PVOID module, GADGET_INFO * out )
+{
+    DWORD text_section_size = 0;
+    DWORD text_section_va   = 0;
+    DWORD counter           = 0;
+    ULONG seed              = 0;
+    ULONG random            = 0;
+    PBYTE text              = NULL;
+
+    GADGET_INFO gadget_list [ 15 ] = { 0 };
+
+    if ( ! get_text_section_size ( module, &text_section_va, &text_section_size ) ) {
+        return FALSE;
+    }
+
+    text = ( PBYTE ) ( ( UINT_PTR ) module + text_section_va );
+
+    for ( DWORD i = 0; i < text_section_size && counter < 15; i++ )
+    {
+        GADGET_INFO candidate  = { 0 };
+        DWORD       remaining  = text_section_size - i;
+
+        if ( match_gadget_pattern ( text + i, remaining, &candidate ) &&
+             is_preceded_by_call ( text, i ) )
+        {
+            candidate.Address        = ( PVOID ) ( text + i );
+            gadget_list [ counter++ ] = candidate;
+        }
+    }
+
+    if ( counter == 0 ) {
+        return FALSE;
     }
 
     seed   = 0x1337;
     random = NTDLL$RtlRandomEx ( &seed );
     random %= counter;
 
-    return gadget_list [ random ];
+    *out = gadget_list [ random ];
+    return TRUE;
 }
 
 ULONG_PTR draugr_wrapper ( PVOID function, PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5, PVOID arg6, PVOID arg7, PVOID arg8, PVOID arg9, PVOID arg10, PVOID arg11, PVOID arg12 )
@@ -319,11 +479,19 @@ ULONG_PTR draugr_wrapper ( PVOID function, PVOID arg1, PVOID arg2, PVOID arg3, P
         return ( ULONG_PTR ) ( NULL );
     }
 
+    GADGET_INFO gadget_info = { 0 };
+
     do
     {
-        draugr_params.Trampoline          = find_gadget ( frame.Gadget );
+        if ( ! find_gadget_info ( frame.Gadget, &gadget_info ) ) {
+            return ( ULONG_PTR ) ( NULL );
+        }
+
+        draugr_params.Trampoline          = gadget_info.Address;
+        draugr_params.GadgetReg           = ( DWORD ) gadget_info.Register;
+        draugr_params.GadgetOffset        = gadget_info.Offset;
         draugr_params.TrampolineStackSize = calculate_function_stack_size_wrapper ( draugr_params.Trampoline );
-        
+
         attempts++;
 
         if ( attempts > 15 ) {
