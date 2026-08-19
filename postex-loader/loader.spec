@@ -31,6 +31,9 @@ x64:
     attach "KERNEL32$VirtualProtect" "_VirtualProtect"
     attach "KERNEL32$VirtualFree"    "_VirtualFree"
 
+
+    preserve "KERNEL32$LoadLibraryA" "init_frame_info"
+
     # mask & link the dll
     generate $MASK 128
     push $DLL
@@ -45,5 +48,7 @@ x64:
     # now get the tradecraft as a PICO
     run "pico.spec"
         link "pico"
+
+    run "yara.spec"
 
     export
