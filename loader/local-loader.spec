@@ -1,6 +1,6 @@
 x64:
     load "bin/loader.x64.o"
-        make pic +gofirst +optimize +disco
+        make pic +gofirst +optimize +disco +mutate
     
     # merge services
     load "bin/services.x64.o"

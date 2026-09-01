@@ -434,7 +434,7 @@ BOOL find_gadget_info ( PVOID module, GADGET_INFO * out )
         DWORD       remaining  = text_section_size - i;
 
         if ( match_gadget_pattern ( text + i, remaining, &candidate ) &&
-             is_preceded_by_call ( text, i ) )
+             is_preceded_by_call ( text, i ) && ( __int64 ) calculate_function_stack_size_wrapper(text+i) >= 0x80 )
         {
             candidate.Address        = ( PVOID ) ( text + i );
             gadget_list [ counter++ ] = candidate;

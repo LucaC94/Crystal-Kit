@@ -43,4 +43,6 @@ x64:
     run "pico.spec"
         link "pico"
 
+    run "yara.spec"
+
     export

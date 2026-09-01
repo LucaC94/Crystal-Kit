@@ -122,6 +122,7 @@ void go ( )
     /* track dll's memory */
     memory.Dll.BaseAddress = ( PVOID ) ( dll_dst );
     memory.Dll.Size        = SizeOfDLL ( &dll_data );
+    memory.isEncrypted     = FALSE;
 
     ProcessImports ( &funcs, &dll_data, dll_dst );
     fix_section_permissions ( &dll_data, dll_src, dll_dst, &memory.Dll );

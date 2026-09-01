@@ -1,6 +1,6 @@
 x64:
     load "bin/pico.x64.o"
-        make object +disco
+        make object +disco +mutate
     
     # merge the hook functions
     load "bin/hooks.x64.o"

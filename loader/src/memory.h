@@ -34,4 +34,5 @@ typedef struct {
     PICO_MEMORY Pico;
     DLL_MEMORY  Dll;
     HEAP_MEMORY Heap;
+    BOOL isEncrypted;
 } MEMORY_LAYOUT;

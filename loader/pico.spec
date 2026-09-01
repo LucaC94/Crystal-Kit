@@ -48,6 +48,7 @@ x64:
     addhook "KERNEL32$DuplicateHandle"    "_DuplicateHandle"
     addhook "KERNEL32$ExitThread"         "_ExitThread"
     addhook "KERNEL32$GetThreadContext"   "_GetThreadContext"
+    #addhook "KERNEL32$GetProcAddress"     "_GetProcAddress"
     addhook "KERNEL32$HeapAlloc"          "_HeapAlloc"
     addhook "KERNEL32$HeapReAlloc"        "_HeapReAlloc"
     addhook "KERNEL32$HeapFree"           "_HeapFree"
@@ -59,6 +60,7 @@ x64:
     addhook "KERNEL32$ResumeThread"       "_ResumeThread"
     addhook "KERNEL32$SetThreadContext"   "_SetThreadContext"
     addhook "KERNEL32$Sleep"              "_Sleep"
+    addhook "KERNEL32$WaitForSingleObject" "_WaitForSingleObject"
     addhook "KERNEL32$UnmapViewOfFile"    "_UnmapViewOfFile"
     addhook "KERNEL32$VirtualAlloc"       "_VirtualAlloc"
     addhook "KERNEL32$VirtualAllocEx"     "_VirtualAllocEx"
@@ -73,5 +75,7 @@ x64:
     attach "KERNEL32$VirtualProtect" "_VirtualProtect"  # this is needed to hook VirtualProtect in mask.c
 
     mergelib "../libtcg.x64.zip"
+
+    run "yara.spec"
 
     export
